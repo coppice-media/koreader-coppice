@@ -1,7 +1,7 @@
 --[[--
 OPDS 2.0 feed -> flat browser rows.
 
-Pure table-to-table mapping, no I/O. Stump's OPDS 2.0 feeds are Readium-style
+Pure table-to-table mapping, no I/O. Coppice's OPDS 2.0 feeds are Readium-style
 JSON: a feed has `metadata`, `links`, `navigation`, `publications`, and
 `groups`, where a group is a titled sub-feed that carries its own `navigation`
 or `publications` (the catalogue root is three groups: Libraries, Latest Books,
@@ -12,7 +12,7 @@ A publication's position is *not* in the publication: it is a
 dashboard uses `/api/v2/reading/continue` instead of walking this feed.
 ]]
 
-local Url = require("stump_url")
+local Url = require("coppice_url")
 
 local Opds = {}
 
@@ -24,11 +24,11 @@ Opds.REL_PROGRESSION = "http://www.cantook.com/api/progression"
 Opds.REL_IMAGE = "http://opds-spec.org/image"
 Opds.REL_THUMBNAIL = "http://opds-spec.org/image/thumbnail"
 
---- The file extension Stump's acquisition media types imply.
+--- The file extension Coppice's acquisition media types imply.
 ---
 --- Only formats KOReader can open are mapped. An unmapped type keeps the
 --- book listed but marks it undownloadable, which is honest: a `.m4b`
---- audiobook is a real Stump book and not a thing this plugin can hand to a
+--- audiobook is a real Coppice book and not a thing this plugin can hand to a
 --- reader engine.
 local EXTENSION_BY_TYPE = {
     ["application/epub+zip"] = "epub",
@@ -64,7 +64,7 @@ local function hasRel(link, rel)
     if value == nil then return false end
     if type(value) == "string" then return value == rel end
     if type(value) == "table" then
-        for _, item in ipairs(value) do
+        for _unused, item in ipairs(value) do
             if item == rel then return true end
         end
     end
@@ -73,13 +73,13 @@ end
 
 local function findLink(links, rel)
     if type(links) ~= "table" then return nil end
-    for _, link in ipairs(links) do
+    for _unused, link in ipairs(links) do
         if type(link) == "table" and hasRel(link, rel) then return link end
     end
     return nil
 end
 
---- The Stump media id, taken from a `/opds/v2.0/books/<id>` style href.
+--- The Coppice media id, taken from a `/opds/v2.0/books/<id>` style href.
 ---
 --- The id is what every other surface keys on: `/api/v2/media/{id}/file`,
 --- `POST /v1/books/{id}/resolve`. Deriving it from the feed avoids a second
@@ -99,7 +99,7 @@ local function authorNames(metadata)
     -- A single contributor object, not a list.
     if author.name then return author.name end
     local names = {}
-    for _, entry in ipairs(author) do
+    for _unused, entry in ipairs(author) do
         if type(entry) == "string" then
             table.insert(names, entry)
         elseif type(entry) == "table" and entry.name then
@@ -124,7 +124,7 @@ function Opds.publication(base, pub)
     local links = pub.links or {}
 
     local acquisitions = {}
-    for _, link in ipairs(links) do
+    for _unused, link in ipairs(links) do
         if type(link) == "table" and hasRel(link, Opds.REL_ACQUISITION) and link.href then
             table.insert(acquisitions, link)
         end
@@ -178,7 +178,7 @@ end
 function Opds.navigation(base, feed)
     local rows = {}
     if type(feed) ~= "table" or type(feed.navigation) ~= "table" then return rows end
-    for _, entry in ipairs(feed.navigation) do
+    for _unused, entry in ipairs(feed.navigation) do
         if type(entry) == "table" and entry.href then
             table.insert(rows, {
                 title = (entry.title or entry.metadata and entry.metadata.title)
@@ -194,7 +194,7 @@ end
 function Opds.publications(base, feed)
     local rows = {}
     if type(feed) ~= "table" or type(feed.publications) ~= "table" then return rows end
-    for _, pub in ipairs(feed.publications) do
+    for _unused, pub in ipairs(feed.publications) do
         local row = Opds.publication(base, pub)
         if row then table.insert(rows, row) end
     end
@@ -205,7 +205,7 @@ end
 function Opds.groups(base, feed)
     local rows = {}
     if type(feed) ~= "table" or type(feed.groups) ~= "table" then return rows end
-    for _, group in ipairs(feed.groups) do
+    for _unused, group in ipairs(feed.groups) do
         if type(group) == "table" then
             local metadata = group.metadata or {}
             local self_link = findLink(group.links, Opds.REL_SELF)
@@ -221,7 +221,7 @@ function Opds.groups(base, feed)
     return rows
 end
 
---- Paging links, re-based. Stump emits `next` unconditionally, so a caller
+--- Paging links, re-based. Coppice emits `next` unconditionally, so a caller
 --- must still notice an empty page rather than trusting `next` to disappear.
 function Opds.paging(base, feed)
     if type(feed) ~= "table" then return {} end
@@ -256,7 +256,7 @@ local ILLEGAL_FILENAME_CHARS = '[/\\%?%%%*:|"<>%c]'
 --- A device-safe filename for a downloaded book.
 ---
 --- FAT32 on a Kobo/Kindle rejects `\\ / : * ? " < > |`; a title can contain
---- any of them. The Stump media id is appended so two books with the same
+--- any of them. The Coppice media id is appended so two books with the same
 --- title in different series cannot overwrite each other.
 function Opds.filename(pub)
     local title = tostring(pub.title or "book")

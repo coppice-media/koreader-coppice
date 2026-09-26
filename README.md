@@ -1,225 +1,296 @@
-# stump.koplugin
+# coppice.koplugin
 
-A KOReader plugin for [Stump](https://github.com/stumpapp/stump): browse and
-download your library from the device, sync reading progress both ways, and
-push highlights, notes and bookmarks back to the server.
+A KOReader companion with a cover-first library UI for Coppice. Browse paged
+cover grids, inspect book details, continue reading, and download books; progress
+sync uses KOReader's built-in KOSync client, with annotations on liseur-sync.
 
-Everything the plugin does uses Stump's existing, documented surfaces. There is
-no Stump-side agent, no companion daemon, and no third-party service.
+The shipped plugin is named **Coppice** and installs as one directory:
+`coppice.koplugin/`. The generic archive contains no account credentials,
+password material, API key, liseur token, pairing nonce, or reusable secret.
 
-| Feature | Stump surface |
+## Install, upgrade, uninstall
+
+1. Build or download `dist/coppice.koplugin.zip`.
+2. Extract the single `coppice.koplugin/` directory into KOReader's `plugins`
+   directory.
+3. Restart KOReader. **Coppice** is first in Tools in both File Manager and
+   Reader; the File Manager also has **Main → Browse Coppice library**.
+
+Typical plugin directories are `/mnt/onboard/.adds/koreader/plugins/` on Kobo,
+`/mnt/us/koreader/plugins/` on Kindle, and `~/.config/koreader/plugins/` on a
+Linux desktop. Do not extract `tests/`, `dist/`, or the repository itself onto
+the device.
+
+An upgrade is a clean replacement of `coppice.koplugin/`. On first load the
+plugin removes the known historical `stump.koplugin` files and its old settings
+file without importing their contents. It never silently reuses an old
+credential. The next pairing therefore issues fresh credentials.
+
+Use **Forget this device pairing** before uninstalling when the device should
+stop using its locally stored credentials. It restores prior KOReader progress
+sync settings while Coppice still owns that target; an uninstall integration can
+call `onUninstall()` for the same cleanup. Server-side device revocation remains
+an operator action in Coppice.
+
+## Using the library
+
+Once the device is paired, Coppice Home opens by itself when KOReader starts
+(once per run; closing a book returns to the file browser). Turn this off with
+**Tools → Coppice → Open Coppice when KOReader starts**. Otherwise open
+**Browse library** from **Tools → Coppice** or **Browse Coppice library** in
+the File Manager Main menu, or bind **Coppice: browse library** to a tap or
+swipe under **Settings → Taps and gestures** (category General).
+
+Home shows library, in-progress, and on-device counts; local reading statistics
+(today, the last seven days, and streak); Continue reading; recent highlights
+and notes; recently opened books; paginated Recently added covers; and the
+Browse actions. Its status line includes time, battery, Wi-Fi, server
+reachability, and queued progress/annotation updates. Recent highlights and
+notes are the four newest from the server across every book and app (Liseur,
+Home, Kobo, KOReader), cached for offline viewing. An audiobook's page offers its
+ebook edition when one is linked; KOReader cannot play audio.
+
+Home is always exactly one screen wide and never scrolls sideways. It fits on
+one screen or scrolls over at most two: each swipe moves a full screen and
+snaps to a card row, and the last swipe stops at the end. On short screens
+(for example a Kobo Clara) the cover rows shrink, three highlights show instead
+of four, and reading stats and recently opened books become compact text rows.
+Browse is a 3 × 3 grid; recently added books and all notes are reached from
+their Home sections. Tap a Continue-reading cover to open its valid local
+file directly; otherwise it opens book details. Long-press always opens details.
+
+Search covers library results. Catalog views use a paginated four-column,
+three-row cover-only grid with a count/sort subtitle, page controls, and a
+**List**/**Covers** toggle. Missing artwork uses a bordered title placeholder;
+only visible image covers are fetched. Thumbnails are cached in KOReader's
+cache directory with a 24 MiB eviction budget. **On device** lists plugin
+downloads identified by their Coppice media-ID sidecars. Book details show
+available metadata, tags, progress, summary, series/author rows, Open or
+format-labelled Download, and Remote notes actions. Reading-list metadata is
+available, but the server does not expose reading-list membership.
+
+## First launch: passwordless pairing
+
+Pairing is the only onboarding flow. If no non-secret server origin was included
+in a personalized archive, enter the Coppice root URL when prompted. The plugin
+then starts the normal five-minute window:
+
+```http
+POST /api/v2/devices/pair/start
+Content-Type: application/json
+
+{"kind":"coppice","name":"KOReader"}
+```
+
+The response contains `pairing_id`, a six-digit **string** `code`, a random
+`nonce`, `expires_at` (RFC 3339 UTC), and `poll_interval_secs`. The code and
+expiry are shown on the device. The nonce is retained only while polling and is
+never used as a credential for any other route.
+
+The plugin polls exactly this endpoint, using the nonce query parameter:
+
+```http
+GET /api/v2/devices/pair/{pairing_id}/status?nonce={nonce}
+```
+
+`pending` is retried; `denied` and `expired` stop with a clear restart message.
+On `approved`, the first response carries the one-time credentials and the
+approved username:
+
+```json
+{
+  "status": "approved",
+  "username": "alice",
+  "credentials": [
+    {"kind":"liseur_token","protocol":"liseur","credential_ref":"…","secret":"…"},
+    {"kind":"api_key","protocol":"koreader","credential_ref":"…","secret":"…"}
+  ],
+  "credential": {"kind":"api_key","protocol":"koreader","secret":"…"},
+  "device": {"id":"…","name":"KOReader","kind":"coppice"},
+  "endpoints": []
+}
+```
+
+`credentials[]` is mapped by the explicit `(kind, protocol)` pair, never by
+array position. The singular `credential` is accepted only for compatibility
+with an older server response and supplies the API lane; a response without
+both lanes is rejected rather than partially configured. The API key is used
+for OPDS Basic (`username:api_key`), `/api/v2` Bearer, downloads, KOSync, and
+progress. The liseur token is used only as a Bearer token on `/v1/*` annotation
+and read-state routes. Both secrets are saved to KOReader's private settings
+only after approval, then automatic KOSync is configured and KOReader is asked
+to restart so its built-in client reloads the settings.
+
+The plugin never asks for an account password and never mints a liseur token
+from account credentials. Pairing approval is required for both auth lanes.
+
+## Optional personalized configuration
+
+The generic archive is built without configuration. A launcher may add exactly
+one non-secret file at `coppice.koplugin/coppice_config.lua`:
+
+```lua
+return {
+    server = "https://books.example.test", -- origin/root only
+    download_dir = "/mnt/onboard/books",   -- optional default
+    device_name = "Kobo Clara",            -- optional display name
+}
+```
+
+Only `server`, `download_dir`, and `device_name` are read. Do not add usernames,
+API keys, liseur tokens, pairing IDs/nonces, cookies, or other secrets. The
+repository builder accepts the same non-secret values as command-line options.
+
+## Deterministic builder
+
+From this repository:
+
+```sh
+./build.sh
+# dist/coppice.koplugin.zip
+./build.sh --server-origin https://books.example.test --device-name "Kobo Clara"
+```
+
+The builder writes one sorted `coppice.koplugin/` tree, uses a fixed ZIP
+ timestamp and stable compression metadata, and rejects legacy product paths in
+the source tree. Running it twice with the same inputs produces the same bytes.
+A personalized launcher may inject only the optional config file above.
+
+## Runtime surfaces
+
+| Feature | Coppice route or behavior |
 | --- | --- |
+| Home counts, paged books, libraries, series, authors, smart lists, details | Authenticated `POST /api/graphql` |
 | Continue reading | `GET /api/v2/reading/continue` |
-| Browse libraries, series, latest books | `GET /opds/v2.0/...` (OPDS 2.0 JSON) |
-| Search | `GET /opds/v2.0/search?query=` |
-| Download a book | `GET /api/v2/media/{id}/file` |
-| Automatic progress sync | KOReader's built-in **Progress sync**, pointed at `/koreader/{api_key}` |
-| On-demand progress push / pull | `PUT` / `GET /koreader/{api_key}/syncs/progress` |
-| Highlights, notes, bookmarks | `POST /v1/annotations` (liseur-sync) |
+| OPDS compatibility | `GET /opds/v2.0/...` |
+| Cover thumbnails | Authenticated `GET /api/v2/media/{id}/thumbnail` and `/api/v2/series/{id}/thumbnail` |
+| Download | `GET /api/v2/media/{id}/file` |
+| Automatic progress | KOReader KOSync at `/koreader/{api_key}` |
+| Explicit progress | `/koreader/{api_key}/syncs/progress` |
+| Annotations/read state | liseur `/v1/*` with the paired device token |
 
-## Install
+The plugin downloads only single-file acquisitions that KOReader can open.
+Folder-backed or multi-track audiobooks remain visible but are not handed to
+the reader. Book identity uses the sidecar media ID, then exact KOReader hash,
+then an explicit user link; it never guesses by title. Reading-list metadata is
+available, but its members are not exposed by the current read API. Collections
+and daily/weekly/streak statistics likewise have no read endpoint.
 
-Copy the plugin folder to your device's KOReader `plugins` directory:
+## Annotation synchronization
 
-```
-<KOReader>/plugins/stump.koplugin/
-```
+Annotations sync in both directions with the liseur-sync service; reading
+progress remains on KOReader's built-in KOSync path. Coppice pulls annotations
+when a linked book opens and from **Sync annotations now**. It pushes after an
+annotation change (debounced), on document close, and on suspend. A per-book
+sidecar and persistent queue retain pending edits, deletes, ID mappings, and
+server revisions while offline; queued writes are retried when KOReader reports
+a network connection.
 
-Where `<KOReader>` is:
+Highlights preserve KOReader's complete color palette (yellow, green, blue,
+pink, purple, orange, red, olive, cyan, and gray) and drawer styles (lighten,
+underline, strikeout, and invert); KOReader's `underscore` is the wire
+`underline`. Notes preserve their body and any locator; bookmarks carry neither
+color nor style. KOReader locators restore their native positions. Readium/Liseur
+locators are imported only when the excerpt and optional before/after context
+produce one unique match in the same chapter or href. Ambiguous or unmatched
+annotations stay in the read-only **Remote notes** list instead of being
+assigned a guessed location.
 
-| Device | Path |
-| --- | --- |
-| Kobo | `/mnt/onboard/.adds/koreader/plugins/` |
-| Kindle | `/mnt/us/koreader/plugins/` |
-| reMarkable | `/home/root/koreader/plugins/` |
-| PocketBook | `/mnt/ext1/applications/koreader/plugins/` |
-| Android | `koreader/plugins/` in the app's storage directory |
-| Desktop (Linux) | `~/.config/koreader/plugins/` or the AppImage's `koreader/plugins/` |
+Writes use `POST /v1/annotations`; pulls use
+`GET /v1/works/{work_id}/annotations?include_deleted=true`, including server
+tombstones; deletes use `DELETE /v1/annotations/{id}?rev={revision}`. Requests
+advertise `X-Liseur-Annotation-Capabilities:
+annotation-color-drawer-v1` so the extended color/style fields are returned.
+Local edits and deletes use stored compare-and-set revisions. On a conflict,
+the newer `client_ts` wins; a local edit newer than a server tombstone is
+recreated under a new stable ID rather than reviving the deleted record.
 
-Only the `stump.koplugin` folder is needed; `tests/` is for development.
-Restart KOReader after copying. The plugin appears as **Stump** under
-`Tools` (☰ → Tools) in both the file browser and the reader.
+Host checks cover bidirectional mapping, style/color fidelity, safe remote
+anchoring, duplicate-pull prevention, persisted queues, deletes, and revision
+conflicts. KOReader UI and device/network behavior still require the
+on-device checklist below.
 
-## Settings
 
-`Tools → Stump`:
+## Screenshots
 
-| Setting | What it is | Needed for |
-| --- | --- | --- |
-| **Server** | Your Stump root URL, e.g. `http://192.168.1.10:10801`. A pasted OPDS, `/api/v2` or `/koreader/<key>` URL is trimmed back to the root for you. | everything |
-| **Username** | Your Stump username. | everything |
-| **Password** | Your Stump password. | highlight export |
-| **API key** | A Stump API key (`Settings → App → API keys`). Needs the `ACCESS_KOREADER_SYNC` permission for progress sync. | progress sync, and preferred for browsing/downloads |
-| **Download folder** | Where downloaded books are written. Defaults to KOReader's download folder. | downloads |
+No screenshots are included in the source archive. Before release, capture the
+portrait Home, cover-grid/list-toggle, and book-detail views on the supported
+KOReader device; verify that text is legible and the full-refresh page turns
+remain comfortable on e-ink.
 
-**Why two credentials.** Stump does not accept one credential everywhere, so
-neither does this plugin:
+## Security and migration notes
 
-| Surface | Accepts |
-| --- | --- |
-| `/opds/v2.0/...` | `Basic <user>:<api key>` **or** `Basic <user>:<password>` |
-| `/api/v2/...` | `Bearer <api key>`, or a `stump_session` cookie from `POST /api/v2/auth/login` |
-| `/koreader/{api_key}/...` | the API key **in the path**; no header |
-| `/v1/...` (annotations) | `Bearer <device secret>`, minted from a `POST /v1/login` |
-
-The API key is preferred wherever it works, because a Stump API key can carry
-narrower permissions than the account. The password is only used for the
-annotation lane, where Stump bcrypt-verifies it and a key cannot stand in. If
-you set only an API key, everything except highlight export works; if you set
-only a password, everything except progress sync works.
-
-## Features
-
-### Continue reading
-
-One request returns your most recently read, unfinished books with their
-positions: `GET /api/v2/reading/continue`. This reads Stump's **unified reading
-state** (`reading_heads`), so a position that arrived from KOReader, a Kobo, a
-Komga client or an audiobook player all show up the same way.
-
-OPDS 2.0 also has a "Keep Reading" feed, but an OPDS publication carries its
-position only as a *link* (`rel=http://www.cantook.com/api/progression`), so
-drawing a progress bar there costs one extra request per row. That is why this
-screen uses the native route.
-
-### Browsing and downloads
-
-Libraries → series → books, latest books, and search, all over OPDS 2.0 JSON.
-Tapping a book downloads it into your download folder and opens it.
-
-The Stump media id is written into the book's KOReader sidecar
-(`stump_media_id`), so progress and highlights later land on the right record
-without a title guess.
-
-### Progress sync
-
-Two paths, and you want both.
-
-**Automatic.** `Set up automatic progress sync` configures KOReader's own
-Progress sync plugin for you: it writes the custom sync server
-(`<server>/koreader/<api key>`), fills in the username/key fields that plugin
-requires, and switches document matching to **Binary**. Restart KOReader
-afterwards so it re-reads its settings. From then on KOReader pushes on page
-turn, suspend and document close, on its own schedule — this plugin does not
-duplicate that.
-
-Stump ignores the kosync username and password (KOReader sends `md5(password)`,
-which cannot be checked against a bcrypt hash); the key in the URL is the
-credential. Binary matching is not optional: Stump identifies a document by
-KOReader's partial MD5, stored as `media.koreader_hash`. With filename matching
-every push is a `404`.
-
-**On demand.** `Push this book's progress now` and `Pull this book's progress
-from Stump` do one round trip each and tell you what happened. The pull offers
-to jump to the server's position.
-
-### Highlights, notes and bookmarks
-
-`Export highlights and notes to Stump` maps the open book's
-`doc_settings.annotations` onto Stump's liseur-sync annotation records:
-
-| KOReader | Stump annotation |
-| --- | --- |
-| `drawer` set (a drawn highlight) | `kind: highlight` |
-| `drawer` unset (a page bookmark) | `kind: bookmark` |
-| `text` (the selected passage) | `excerpt` |
-| `note` (your own note) | `body`, on a highlight |
-| `color` | `color`, if it is one of Stump's six palette tokens |
-| `page` / `pos0` / `pos1` / `pageno` / `chapter` / `drawer` | `locator`, verbatim |
-| `pageno / page count` | `progression` |
-| `datetime` | `client_ts` (converted from device-local time to UTC) |
-
-The locator is opaque to the server and is replayed byte for byte, so a
-crengine DOM x-pointer stays an x-pointer: it is **not** converted into a
-Readium locator or an EPUB CFI, because that would fabricate an anchor.
-
-Each record's id is derived from its anchor and creation time, so re-exporting
-the same book updates the same records instead of creating copies. The last
-accepted revision per record is remembered in the book's sidecar
-(`stump_annotation_revs`), which is what makes the second export a
-compare-and-set edit rather than a conflict.
-
-Stump's `note` kind is never produced: it is defined as the *unanchored* one,
-and every KOReader annotation has an anchor. A highlight that has a note keeps
-its anchor and carries the note in `body`.
-
-### Linking a sideloaded book
-
-A book that was not downloaded through the plugin is matched in three steps,
-most reliable first:
-
-1. the sidecar's `stump_media_id`, written by the plugin's own download;
-2. the book's partial MD5 matched against `koreaderHash` from
-   `/api/v2/reading/continue` — the same value Stump stores as
-   `media.koreader_hash`, so any book that has ever synced progress is
-   identified exactly;
-3. `Link this book to a Stump book…`, which searches the library and lets you
-   pick.
-
-Nothing is guessed from a title.
-
-## Limitations
-
-- **Audiobooks cannot be downloaded.** A multi-file audiobook advertises one
-  acquisition link per track; that is a playlist, not a book file. It still
-  appears in the catalogue and on the dashboard.
-- **Highlight export needs a file-backed book.** Stump resolves a book's work
-  identity by digesting the file. A directory-backed book (a multi-file
-  audiobook, a folder book) answers `500 Is a directory`, which the plugin
-  reports as-is.
-- **Highlight export can hit a `409`.** If two copies of the same book in your
-  library claim the same identity, Stump refuses to guess which work you meant
-  (`identifiers resolve to multiple works`). Resolve the duplicate server-side.
-- **`/opds/v2.0/books/browse` is not offered.** Its handler flattens the
-  pagination struct into its query parameters, and a flattened serde struct
-  cannot coerce a query string: `?page=1` answers `400 invalid type: string
-  "1", expected u64`, and so does the `next` link the feed emits. Libraries,
-  series, latest books and search reach every book and page correctly.
-- **Progress is one-shot per direction.** Automatic background sync is
-  KOReader's built-in plugin, configured by this one. There is no
-  plugin-owned scheduler.
-- **Highlights are push-only.** Deletions made on the device are not
-  tombstoned on the server, and annotations created elsewhere are not imported
-  into KOReader. The plugin reads the server's live set only to report a count.
-- **No Readium locator translation.** Progress and annotation anchors travel in
-  KOReader's own format.
+- The start route is unauthenticated because the device has no credential yet;
+  approval is still mandatory before any secret is issued.
+- The six-digit code is displayed only for the five-minute window. The server
+  binds polling to the nonce and returns the one-time secrets only on the first
+  approved poll.
+- Credential-bearing API requests stay on the configured origin, use bounded
+  response sizes, and publish completed downloads only after a successful
+  same-origin transfer. User-facing failures never show URLs or raw response
+  bodies.
+- The API key appears in the KOSync path because that protocol requires it; the
+  paired polling nonce is scoped to its status request. Forgetting the pairing
+  restores prior KOSync credentials when a backup exists and removes legacy
+  Coppice KOSync credentials when it does not.
+- Historical plugin settings and known old files are deleted explicitly during
+  migration. Unknown files are not recursively deleted. No old secret is
+  imported.
 
 ## Verification
 
-Every HTTP call the plugin makes has been exercised with `curl` against a live
-Stump built from `apps/server` (`headless,liseur-sync`): OPDS 2.0 browse and
-search under both Basic credentials, `/api/v2/reading/continue` under a Bearer
-API key and under a session cookie, the file download (including a `Range`
-request), the three kosync routes, and the whole annotation lane
-(`login` → `tokens` → `token` → `books/{id}/resolve` → `annotations` create,
-stale replay → `conflict`, edit → `rev 2`, live read).
-
-The pure functions — URL building, OPDS mapping, annotation mapping, the kosync
-settings patch — are checked by `tests/pure_checks.lua`:
+Pure behavior checks cover catalog mapping, layout and paging, URL construction,
+cache eviction, OPDS, bidirectional annotation/color/style mapping, queue
+persistence and idempotence, edit/delete revision conflicts, exact/readium
+anchoring, tombstone removal, KOSync settings, credential-lane selection, and
+migration boundaries. The host browser harness exercises search submission
+through the default Enter action, the live GraphQL result shape and cover grid,
+downloaded Continue-reading tap/long-press behavior, and the 305-book visible-page
+regression at both supported test geometries.
 
 ```sh
-lua tests/pure_checks.lua      # or luajit, or lua5.1
+luajit tests/pure_checks.lua
+luajit tests/browser_checks.lua
+tests/static_checks.sh
+for module in coppice.koplugin/*.lua; do luajit -b "$module" /dev/null; done
 ```
 
-**The plugin has never been run inside KOReader.** No device or desktop
-KOReader run has happened: the Lua loads and the pure logic is checked, and
-the server contract it targets is verified, but the UI, the menu wiring, the
-network calls in KOReader's own environment, and the interaction with the
-built-in Progress sync plugin are unverified.
+## On-device checklist
+
+- Open a linked book and confirm the server's annotations pull once; pull again
+  and verify no duplicates. Check exact KOReader x-pointer restoration and
+  Readium excerpt/context anchoring in the same chapter or href.
+- Confirm unsupported/ambiguous excerpts remain only in **Remote notes** and
+  are not inserted at a guessed position.
+- Add and recolor/restyle a highlight, add a note, and add a bookmark. Verify
+  automatic push after the debounce, then repeat after document close and
+  suspend. Confirm all ten colors and four styles round-trip.
+- Edit and delete a previously synced annotation; verify the stored revision is
+  honored. Exercise an offline edit/delete followed by reconnect and confirm
+  the persisted queue drains once without losing the last edit.
+- Pull an annotation from another device, then remove it remotely and reopen
+  the book; the imported annotation should disappear. Confirm reading progress
+  still uses KOReader's built-in KOSync.
 
 ## Layout
 
-| File | Responsibility |
+| Path | Responsibility |
 | --- | --- |
-| `main.lua` | Plugin lifecycle, settings, menu, progress and annotation actions |
-| `stump_api.lua` | HTTP client for all four surfaces and their credentials |
-| `stump_url.lua` | URL building and normalization (pure) |
-| `stump_opds.lua` | OPDS 2.0 feed → browser rows (pure) |
-| `stump_annotations.lua` | KOReader annotations → liseur-sync records (pure) |
-| `stump_kosync.lua` | Configures KOReader's built-in Progress sync plugin |
-| `stump_browser.lua` | The browser `Menu`: dashboard, catalogue, downloads |
-| `tests/pure_checks.lua` | Checks for the pure modules |
+| `coppice.koplugin/main.lua` | lifecycle, pairing UI, settings, progress, annotations |
+| `coppice.koplugin/coppice_api.lua` | authenticated REST/GraphQL requests, downloads, and asset transfer |
+| `coppice.koplugin/coppice_pairing.lua` | pure credential/status mapping |
+| `coppice.koplugin/coppice_settings.lua` | pure persisted-setting validation |
+| `coppice.koplugin/coppice_errors.lua` | safe, localized request error summaries |
+| `coppice.koplugin/coppice_migration.lua` | explicit historical-file retirement |
+| `coppice.koplugin/coppice_url.lua` | URL validation, encoding, and origin confinement |
+| `coppice.koplugin/coppice_opds.lua` | OPDS parsing and feed-link normalization |
+| `coppice.koplugin/coppice_annotations.lua` | KOReader annotation mapping and revision signatures |
+| `coppice.koplugin/coppice_annotation_sync.lua` | bidirectional annotation state, queue, and reconciliation |
+| `coppice.koplugin/coppice_kosync.lua` | built-in KOSync configuration |
+| `coppice.koplugin/coppice_browser.lua` | cover-first browsing, details, downloads, and reading |
+| `coppice.koplugin/coppice_catalog.lua` | pure catalog mapping, layout, paging, URLs, and cache eviction |
+| `tests/static_checks.sh` | fails on undeclared globals, undefined `self:` methods and missing KOReader icons (device-only runtime errors) |
+| `tests/pure_checks.lua` | deterministic pure behavior checks |
+| `build.py`, `build.sh` | deterministic generic archive builder |
 
-## Licence
-
-MIT, matching Stump.
+MIT License.

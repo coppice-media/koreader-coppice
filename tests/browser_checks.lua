@@ -10,6 +10,8 @@ local function widgetClass()
         function child:new(args)
             args = args or {}
             setmetatable(args, { __index = child })
+            -- Like Widget:new: base `_init` first, then the widget's `init`.
+            if args._init then args:_init() end
             if args.init then args:init() end
             return args
         end
@@ -18,6 +20,7 @@ local function widgetClass()
     function class:new(args)
         args = args or {}
         setmetatable(args, { __index = self })
+        if args._init then args:_init() end
         return args
     end
     local function childSize(child)
@@ -83,6 +86,29 @@ do
     function span:getSize() return { w = 0, h = self.width or 0 } end
 end
 require("ui/widget/container/scrollablecontainer").scroll_bar_width = 6
+-- InputContainer as KOReader master (1c8724e9) builds it: `_init` owns the
+-- instance key_events table and binds the physical Home key in it.
+do
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    function InputContainer:_init()
+        self.key_events = self.key_events or {}
+        if require("device"):hasKeys() then self.key_events.Home = { { "Home" } } end
+        self.ges_events = self.ges_events or {}
+    end
+    -- KOReader's key dispatch, reduced to one unmodified key name.
+    function InputContainer:onKeyPress(key)
+        for name, seq in pairs(self.key_events) do
+            for _, oneseq in ipairs(seq) do
+                local wanted = oneseq[1]
+                local hit = wanted == key
+                if type(wanted) == "table" then
+                    for _, variant in ipairs(wanted) do hit = hit or variant == key end
+                end
+                if hit and self["on" .. name] then return self["on" .. name](self) end
+            end
+        end
+    end
+end
 module("ui/size", { line = { thick = 2, thin = 1 }, border = { thick = 2 }, radius = { button = 7 } })
 
 local screen_width, screen_height = 671, 1568
@@ -91,7 +117,9 @@ local screen = {
     getHeight = function() return screen_height end,
     scaleBySize = function(_, value) return value end,
 }
-module("device", { screen = screen })
+module("device", { screen = screen, hasKeys = function() return true end,
+    input = { group = { Back = { "Back" } } } })
+module("ui/event", { new = function(_, name) return { handler = "on" .. name } end })
 module("datastorage", { getDataDir = function() return "/tmp" end,
     getSettingsDir = function() return "/tmp" end })
 module("ui/network/manager", { runWhenConnected = function(_, callback) callback() end,
@@ -100,6 +128,8 @@ local ui_manager = {
     setDirty = function() end,
     show = function(self, widget) self.shown = widget end,
     close = function(self, widget) self.closed = widget end,
+    nextTick = function(_, callback) callback() end,
+    sendEvent = function(self, event) self.sent = event end,
 }
 module("ui/uimanager", ui_manager)
 module("ui/font", { getFace = function(_, _, size) return size end })
@@ -111,7 +141,7 @@ module("ui/geometry", { new = function(_, value) return geom(value) end })
 module("ui/gesturerange", { new = function(_, value) return value end })
 module("ffi/blitbuffer", { COLOR_WHITE = "white", COLOR_BLACK = "black",
     COLOR_GRAY = "gray", COLOR_LIGHT_GRAY = "lightgray", COLOR_DARK_GRAY = "darkgray",
-    HIGHLIGHT_COLORS = { yellow = "#FFFF33" },
+    HIGHLIGHT_COLORS = { yellow = "#FFFF33", green = "#00AA66", blue = "#0066FF" },
     ColorRGB32 = function(r, g, b, a) return { r = r, g = g, b = b, a = a } end })
 local local_files = {}
 module("libs/libkoreader-lfs", {
@@ -362,4 +392,86 @@ for _, size in ipairs({ { 671, 1568 }, { 1072, 1448 } }) do
         "See all notes control meets the scaled touch target")
     print(string.format("browser_checks: %dx%d grid has no overlap and touch targets >=48 px",
         screen_width, screen_height))
+end
+
+-- Physical keys. KOReader master binds Home on every InputContainer in
+-- `_init`; the browser must merge its own bindings into that table, close on
+-- Home through onClose(), and still close on v2026.07.1 where the base class
+-- has no onHome().
+do
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local closed = 0
+    local keyed = Browser:new{
+        api = api,
+        cache_dir = "/tmp/coppice-harness-keys-covers",
+        close_callback = function() closed = closed + 1 end,
+    }
+    assert(keyed.key_events.Home and keyed.key_events.Back,
+        "Back is merged next to the Home binding KOReader made")
+    keyed:openScreen({ kind = "all_books", title = "All Books" })
+    assert(keyed:onKeyPress("Back") == true and #keyed.history == 0 and closed == 0,
+        "Back key steps back through the browser's history")
+    -- v2026.07.1: no InputContainer:onHome, the browser closes itself and
+    -- hands Home to the reader or file manager underneath.
+    ui_manager.sent = nil
+    assert(keyed:onKeyPress("Home") == true and closed == 1,
+        "Home key closes the browser on KOReader v2026.07.1")
+    assert(ui_manager.sent and ui_manager.sent.handler == "onHome",
+        "Home is re-sent so the widget underneath acts on it too")
+    -- master: the inherited handler closes window-level widgets via onClose().
+    local upstream_calls = 0
+    function InputContainer:onHome()
+        upstream_calls = upstream_calls + 1
+        return self:onClose()
+    end
+    ui_manager.sent = nil
+    assert(keyed:onKeyPress("Home") == true and upstream_calls == 1 and closed == 2
+            and ui_manager.sent == nil,
+        "on KOReader master the upstream Home daisy-chain closes the browser through onClose")
+    InputContainer.onHome = nil
+    assert(keyed:onClose() == true and closed == 3,
+        "KOReader's Close broadcast (exit, USB storage) closes the browser")
+    -- Sub-widgets keep KOReader's own instance bindings and add none.
+    local tile = keyed:coverTile(media[1], 200, 260, function() end)
+    assert(tile.key_events ~= keyed.key_events and tile.key_events.Home
+            and tile.key_events.Back == nil,
+        "cover tiles keep the Home binding KOReader made and no browser bindings")
+    print("browser_checks: Home/Back/Close key handling passed for v2026.07.1 and master")
+end
+
+-- Highlight chips are tinted with the reader's own colours: a custom code the
+-- user set for a KOReader colour name wins over the built-in, unknown names
+-- keep their fallback.
+do
+    local function chipOf(item)
+        local card = Browser:new{ api = api, cache_dir = "/tmp/coppice-harness-chip-covers" }
+            :annotationCard(item, 500)
+        return card[1][1][1][1][1][1]
+    end
+    local builtin = chipOf({ id = "1", kind = "highlight", color = "yellow", title = "Book" })
+    assert(builtin.color.r == 255 and builtin.color.g == 255 and builtin.color.b == 0x33,
+        "built-in KOReader colours tint the chip border with their hex code")
+    assert(builtin.background.r == 255 and builtin.background.b == math.floor(0x33 * 0.45 + 255 * 0.55),
+        "the chip fill is the colour mixed towards white")
+    G_reader_settings:saveSetting("highlight_custom_colors", {
+        yellow = { name = "Sand", code = "#C0A060" },
+        green = { name = "Moss" }, -- renamed only: keeps the built-in code
+        blue = { code = "not a colour" },
+    })
+    local custom = chipOf({ id = "2", kind = "highlight", color = "Yellow", title = "Book" })
+    assert(custom.color.r == 0xC0 and custom.color.g == 0xA0 and custom.color.b == 0x60,
+        "a custom colour code from the reader settings tints the chip")
+    local renamed = chipOf({ id = "3", kind = "highlight", color = "green", title = "Book" })
+    assert(renamed.color.r == 0x00 and renamed.color.g == 0xAA and renamed.color.b == 0x66,
+        "a renamed colour without a custom code keeps KOReader's built-in code")
+    local invalid = chipOf({ id = "4", kind = "highlight", color = "blue", title = "Book" })
+    assert(invalid.color.r == 0x00 and invalid.color.g == 0x66 and invalid.color.b == 0xFF,
+        "a malformed custom code is ignored in favour of the built-in")
+    local pink = chipOf({ id = "5", kind = "highlight", color = "pink", title = "Book" })
+    assert(pink.color.r == 0xFF and pink.color.g == 0x66 and pink.color.b == 0xAA,
+        "Liseur's pink keeps its fallback colour")
+    assert(chipOf({ id = "6", kind = "note", title = "Book" }).color == "black",
+        "uncoloured notes keep the plain chip")
+    G_reader_settings:saveSetting("highlight_custom_colors", nil)
+    print("browser_checks: highlight chips follow the reader's custom colours")
 end

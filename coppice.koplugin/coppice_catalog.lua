@@ -387,10 +387,19 @@ function Catalog.recentAnnotationsRequest(limit, page)
             items {
                 id kind source sourceDeviceName color excerpt note
                 page progression chapterTitle createdAt updatedAt
-                book { mediaId title }
+                book { mediaId title koreaderHash }
             }
         }
     }]], { pagination = { page = page, pageSize = limit } }
+end
+
+-- GraphQL routes Liseur-lane notes as `liseur-sync:<user id>:<note id>` so
+-- Home edits hit the right lane; KOReader stores the bare note id in
+-- `coppice_id`, so matching and de-duplication use the bare id.
+function Catalog.bareAnnotationId(id)
+    if id == nil then return nil end
+    id = tostring(id)
+    return id:match("^liseur%-sync:[^:]+:(.+)$") or id
 end
 
 -- One server annotation as a Home "Recent highlights & notes" item.
@@ -411,9 +420,11 @@ function Catalog.serverAnnotation(entry)
         if device and device ~= source then source = source .. " · " .. device end
     end
     return {
-        id = tostring(entry.id),
+        id = Catalog.bareAnnotationId(entry.id),
         kind = kind,
         book_id = book.mediaId and tostring(book.mediaId) or nil,
+        book_hash = type(book.koreaderHash) == "string" and book.koreaderHash ~= ""
+            and book.koreaderHash or nil,
         title = book.title,
         book_title = book.title,
         excerpt = entry.excerpt,

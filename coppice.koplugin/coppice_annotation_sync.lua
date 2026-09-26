@@ -32,6 +32,7 @@ function Sync.newState(saved)
         work_id = saved.work_id,
         book_id = saved.book_id,
         document_hash = saved.document_hash,
+        edition_sha = saved.edition_sha,
         revisions = copy(map(saved.revisions)),
         id_map = copy(map(saved.id_map)),
         managed = copy(map(saved.managed)),
@@ -542,8 +543,9 @@ local function nativeAnchor(record, options)
         chapter = locator.chapter }
 end
 
-local function localClientTs(item, state, options)
-    local input = Annotations.one(item, {
+--- The wire input `plan` would build for `item` right now.
+local function localInput(item, state, options)
+    return Annotations.one(item, {
         work_id = options.work_id,
         edition_sha = options.edition_sha,
         document_hash = options.document_hash,
@@ -552,6 +554,10 @@ local function localClientTs(item, state, options)
         revisions = state.revisions,
         id_map = state.id_map,
     })
+end
+
+local function localClientTs(item, state, options)
+    local input = localInput(item, state, options)
     return input and input.client_ts
 end
 
@@ -583,21 +589,16 @@ local function putLocal(item, options, previous)
     return item
 end
 
-local function markRemoteRevision(record, state, options, item, use_local_signature)
-    local signature = serverSignature(record, options.digest)
+--- Record `record.rev` as the acknowledged revision of `item`.
+---
+--- `signature` is what the next `plan` compares its freshly built local input
+--- against, so it must be a *local* input signature whenever a local item
+--- exists: KOReader normalises an import (default drawer, dropped empty
+--- colour, ...) and the wire signature of the same record differs from it.
+--- Only when nothing local was ever acknowledged does the wire signature
+--- stand in.
+local function markRemoteRevision(record, state, options, item, signature)
     if item then
-        local input = Annotations.one(item, {
-            work_id = options.work_id,
-            edition_sha = options.edition_sha,
-            document_hash = options.document_hash,
-            page_count = options.page_count,
-            digest = options.digest,
-            revisions = state.revisions,
-            id_map = state.id_map,
-        })
-        if use_local_signature then
-            signature = inputSignature(input, options.digest) or signature
-        end
         local local_id = Annotations.localId(item, options.document_hash,
             options.digest)
         if local_id then state.id_map[local_id] = record.id end
@@ -605,7 +606,7 @@ local function markRemoteRevision(record, state, options, item, use_local_signat
     end
     state.revisions[record.id] = {
         rev = tonumber(record.rev),
-        signature = signature,
+        signature = signature or serverSignature(record, options.digest),
         client_ts = record.client_ts,
     }
 end
@@ -673,19 +674,12 @@ function Sync.reconcile(records, state, options)
                 client_ts = record.client_ts,
             }
         else
-            local local_ts = item and localClientTs(item, state, options)
-            local local_input = item and Annotations.one(item, {
-                work_id = options.work_id,
-                edition_sha = options.edition_sha,
-                document_hash = options.document_hash,
-                page_count = options.page_count,
-                digest = options.digest,
-                revisions = state.revisions,
-                id_map = state.id_map,
-            })
+            local local_input = item and localInput(item, state, options)
+            local local_ts = local_input and local_input.client_ts
             local local_signature = local_input
                 and inputSignature(local_input, options.digest)
             local previous = state.revisions[id]
+            if type(previous) ~= "table" then previous = nil end
             local same_local = previous and previous.signature == local_signature
                 and previous.client_ts == record.client_ts
             local use_server = not item or (not same_local
@@ -700,7 +694,9 @@ function Sync.reconcile(records, state, options)
                 if imported then
                     putLocal(imported, options, item)
                     state.remote_notes[id] = nil
-                    markRemoteRevision(record, state, options, imported, true)
+                    markRemoteRevision(record, state, options, imported,
+                        inputSignature(localInput(imported, state, options),
+                            options.digest))
                     if item then counts.updated = counts.updated + 1
                     else counts.imported = counts.imported + 1 end
                 else
@@ -717,7 +713,11 @@ function Sync.reconcile(records, state, options)
                     counts.remote = counts.remote + 1
                 end
             else
-                markRemoteRevision(record, state, options, item, false)
+                -- Unchanged, or a newer local edit awaiting push: the
+                -- acknowledged signature stays so `plan` only queues what the
+                -- user actually changed.
+                markRemoteRevision(record, state, options, item,
+                    previous and previous.signature)
             end
             if action and action.op == "delete"
                     and not Annotations.timestampAfter(action.client_ts,

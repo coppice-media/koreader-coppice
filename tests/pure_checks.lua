@@ -1179,6 +1179,135 @@ eq(saturated_state.remote_notes["readium-saturated-id"].reason,
     "too-many-matches", "saturated search remains in Remote notes")
 eq(#saturated_options.items, 0, "saturated search does not import an item")
 
+group("AnnotationSync imported records are not echoed back")
+do
+-- A Coppice Home note: Readium locator, no drawer, empty colour and body
+-- omitted on the wire, `edition_sha` sometimes absent. KOReader normalises
+-- it on import (default drawer, pageno), which must not count as an edit.
+local function homeRecord(id, body, rev, edition_sha)
+    return {
+        id = id, rev = rev or 1, seq = rev or 1, work_id = "w1",
+        edition_sha = edition_sha, kind = "highlight",
+        locator = {
+            chapterTitle = "Chapter One", href = "OPS/chapter-one.xhtml",
+            locations = { progression = 0.62, totalProgression = 0.62 },
+            text = { before = "intro text before", after = "continuation after",
+                highlight = "Unique phrase from Readium" },
+            type = "application/xhtml+xml",
+        },
+        excerpt = "Unique phrase from Readium", body = body,
+        device_id = "stump-native", client_ts = "2026-09-24T17:16:05.254687989Z",
+        updated_at = "2026-09-24T17:16:05.254687989Z",
+    }
+end
+local function homeServer(seed)
+    local server = annotationServer(seed)
+    server.pushes, server.deletes = {}, {}
+    local push, delete = server.liseurPushAnnotations, server.liseurDeleteAnnotation
+    function server:liseurPushAnnotations(secret, batch)
+        for _, input in ipairs(batch) do
+            server.pushes[#server.pushes + 1] = AnnotationSync.copy(input)
+        end
+        local body = push(self, secret, batch)
+        -- Like Coppice, the server omits empty colour, drawer, and body.
+        for _, record in pairs(self.records) do
+            for _, key in ipairs({ "color", "drawer", "body" }) do
+                if record[key] == "" then record[key] = nil end
+            end
+        end
+        return body
+    end
+    function server:liseurDeleteAnnotation(secret, id, revision)
+        server.deletes[#server.deletes + 1] = { id = id, rev = revision }
+        return delete(self, secret, id, revision)
+    end
+    return server
+end
+local echo_server = homeServer({
+    ["home-noted"] = homeRecord("home-noted", "Deliberately ordinary", 1, ""),
+    ["home-bare"] = homeRecord("home-bare", nil, 1, nil),
+})
+local echo_items = {}
+local echo_annotation = { annotations = echo_items }
+function echo_annotation:addItem(item)
+    -- ReaderAnnotation:addItem: KOReader stamps its own page bookkeeping.
+    item.datetime = item.datetime or "2026-09-26 14:00:00"
+    item.pageno = 7
+    item.pageref = "7"
+    table.insert(self.annotations, item)
+    return #self.annotations
+end
+local echo_state = AnnotationSync.newState()
+local function echoSession(pull, session)
+    local sync = AnnotationSync.new({
+        api = echo_server, secret = "test-secret", work_id = "w1",
+        edition_sha = session and session.edition_sha or "resolved-edition-sha",
+        document_hash = "doc", page_count = 20, digest = digest,
+        state = echo_state, items = echo_items, annotation = echo_annotation,
+        ui = { toc = toc }, document = readium_document, default_drawer = "lighten",
+    })
+    local ok, result = sync:run(pull)
+    echo_state = sync.state
+    return ok, result
+end
+local echo_ok, echo_result = echoSession(true)
+ok(echo_ok, "first session pulls the Home notes")
+eq(echo_result.pull.imported, 2, "both Home notes anchor and import")
+eq(echo_items[1].drawer, "lighten", "import applies the default drawer")
+eq(#echo_server.pushes, 0, "importing pushes nothing")
+echoSession(true)
+eq(#echo_server.pushes, 0,
+    "reopening the book does not push untouched imports back")
+eq(echo_server.records["home-noted"].rev, 1, "server revision is untouched")
+eq(echo_server.records["home-noted"].drawer, nil,
+    "Home note keeps no drawer on the server")
+-- Queued drain (book closed): no document, no resolved edition sha.
+AnnotationSync.plan(echo_items, echo_state, {
+    work_id = "w1", document_hash = "doc", page_count = 20, digest = digest,
+})
+AnnotationSync.drain(echo_server, "test-secret", echo_state, {
+    work_id = "w1", document_hash = "doc", page_count = 20, digest = digest,
+})
+eq(#echo_server.pushes, 0,
+    "queued drain without a resolved edition sha pushes nothing either")
+local echo_bare = AnnotationSync.currentItem(echo_state, "home-bare",
+    echo_items, { document_hash = "doc", digest = digest })
+local echo_noted = AnnotationSync.currentItem(echo_state, "home-noted",
+    echo_items, { document_hash = "doc", digest = digest })
+ok(echo_bare ~= nil and echo_noted ~= nil, "both imports are addressable")
+echo_noted.note = "edited on the device"
+echo_noted.datetime_updated = "2026-09-26 15:00:00"
+echoSession(true)
+eq(#echo_server.pushes, 1, "editing the note text pushes exactly one update")
+eq(echo_server.pushes[1].id, "home-noted", "only the edited note is pushed")
+eq(echo_server.pushes[1].base_rev, 1, "the update expects the imported revision")
+eq(echo_server.pushes[1].body, "edited on the device", "the edited body travels")
+eq(echo_server.pushes[1].edition_sha, "resolved-edition-sha",
+    "an edit carries the session's edition sha")
+eq(echo_server.records["home-noted"].rev, 2, "the edit advances the revision")
+echoSession(true)
+eq(#echo_server.pushes, 1, "an acknowledged edit is not pushed again")
+echo_bare.color = "green"
+echo_bare.datetime_updated = "2026-09-26 15:01:00"
+echoSession(true)
+eq(#echo_server.pushes, 2, "changing the colour pushes exactly one update")
+eq(echo_server.pushes[2].id, "home-bare", "only the recoloured note is pushed")
+eq(echo_server.pushes[2].color, "green", "the new colour travels")
+eq(echo_server.pushes[2].base_rev, 1, "the recolour expects its imported revision")
+for index = #echo_items, 1, -1 do
+    if echo_items[index] == echo_noted then table.remove(echo_items, index) end
+end
+echoSession(false)
+eq(#echo_server.deletes, 1, "deleting the note pushes exactly one delete")
+eq(echo_server.deletes[1].id, "home-noted", "the deleted note is the one removed")
+eq(echo_server.deletes[1].rev, 2, "the delete expects the edited revision")
+eq(echo_server.records["home-noted"].deleted, true, "server records the tombstone")
+echoSession(true)
+eq(#echo_server.pushes, 2, "a pull after the delete pushes nothing")
+eq(#echo_server.deletes, 1, "a pull after the delete deletes nothing")
+eq(#echo_items, 1, "the tombstone does not resurrect the deleted note")
+end
+
 
 -- --------------------------------------------------------------- kosync
 
@@ -1496,6 +1625,13 @@ eq(Catalog.serverAnnotation({ id = 1, source = "WEB", book = {} }).source, "Home
 eq(Catalog.serverAnnotation({ kind = "NOTE" }), nil, "entries without an id are dropped")
 eq(Catalog.serverAnnotation({ id = 2, source = "COPPICE", sourceDeviceName = "KOReader test", book = {} }).source,
     "KOReader test", "Coppice reader clients are labelled by their device name")
+eq(Catalog.serverAnnotation({ id = 3, book = { mediaId = "m1", koreaderHash = "285f70" } }).book_hash,
+    "285f70", "the book's KOReader hash travels with the note to find an identical local copy")
+eq(Catalog.serverAnnotation({ id = 4, book = { mediaId = "m1", koreaderHash = "" } }).book_hash,
+    nil, "an empty hash never matches a local file")
+eq(Catalog.serverAnnotation({ id = "liseur-sync:eacb815a-c211-46ed-bcfa-5088a3dd9b7b:stump-native:annotation:b695", book = {} }).id,
+    "stump-native:annotation:b695", "a routed Liseur-lane id is matched by its bare note id")
+eq(Catalog.serverAnnotation({ id = "42", book = {} }).id, "42", "native Home ids pass through unchanged")
 eq(select(2, Catalog.recentAnnotationsRequest(6, 3)).pagination.page, 3, "all-notes screen requests the chosen page")
 ok(Catalog.recentAnnotationsRequest(6, 1):find("total", 1, true) ~= nil, "all-notes screen gets the total for paging")
 local utc_base = Catalog.utcEpoch(2026, 9, 24, 12, 0, 0)
@@ -1538,6 +1674,91 @@ eq(Catalog.readerExtension("../m4b"), nil, "unsafe and non-reader formats are re
 eq(Catalog.readerExtension("fb2.zip"), "fb2.zip", "compound supported format is retained")
 eq(Catalog.cacheFileName("media", "abc-123"), "media-abc-123.jpg",
     "cache extension is recognized by KOReader's image registry")
+
+-- KOReader master (ReaderHighlight:mergeHighlights, 1c8724e9) merges by
+-- deleting every selected highlight and saving one new item carrying only
+-- item1.datetime, the joined notes and the widened pos0/pos1 — none of the
+-- plugin's fields. The next plan must turn that into deletes plus an upsert.
+-- (A function, not a bare block: this chunk is at Lua's 200-local limit.)
+local function checkMergedHighlights()
+    group("AnnotationSync merged highlights")
+    local function highlight(datetime, pos0, pos1, text, note, coppice_id)
+        return {
+            datetime = datetime, drawer = "lighten", color = "yellow",
+            text = text, note = note, page = pos0, pos0 = pos0, pos1 = pos1,
+            pageno = 12, chapter = "One", coppice_id = coppice_id,
+        }
+    end
+    local merge_options = { work_id = "w1", document_hash = "doc", digest = digest, now = 0 }
+    local function synced(items)
+        local state = AnnotationSync.newState()
+        local inputs = AnnotationSync.plan(items, state, merge_options)
+        for _unused, input in ipairs(inputs) do
+            AnnotationSync.accept(state, input.id, 1,
+                state.queue[input.id].signature, input.client_ts)
+        end
+        AnnotationSync.plan(items, state, merge_options)
+        eq(next(state.queue), nil, "synced highlights start with an empty queue")
+        return state, inputs[1].id, inputs[2].id
+    end
+    local function queued(state, op)
+        local ids = {}
+        for id, action in pairs(state.queue) do
+            if action.op == op then ids[#ids + 1] = id end
+        end
+        table.sort(ids)
+        return ids
+    end
+
+    local first = highlight("2026-01-01 10:00:00", "/body/p[1]/text()[1].0",
+        "/body/p[1]/text()[1].18", "first passage", "first note")
+    local second = highlight("2026-01-01 10:05:00", "/body/p[1]/text()[1].20",
+        "/body/p[1]/text()[1].40", "second passage", "second note")
+    local state, first_id, second_id = synced({ first, second })
+    local merged = highlight(first.datetime, first.pos0, second.pos1,
+        "first passage and second passage", first.note .. "\n" .. second.note)
+    local inputs = AnnotationSync.plan({ merged }, state, merge_options)
+    eq(#inputs, 1, "the merged highlight is the only local input")
+    ok(inputs[1].id ~= first_id and inputs[1].id ~= second_id,
+        "a widened highlight is a new annotation, not an edit of either original")
+    eq(inputs[1].base_rev, 0, "the merged highlight is created, not compare-and-set")
+    eq(inputs[1].body, "first note\nsecond note", "joined notes travel as the body")
+    eq(table.concat(queued(state, "delete"), ","),
+        table.concat({ first_id < second_id and first_id or second_id,
+            first_id < second_id and second_id or first_id }, ","),
+        "both originals are queued as server deletes")
+    eq(#queued(state, "upsert"), 1, "one upsert for the merged highlight")
+    eq(state.queue[first_id].rev, 1, "deletes carry the originals' server revisions")
+    eq(state.queue[inputs[1].id].op, "upsert", "the merged highlight is queued")
+
+    -- Containment: the inner highlight is swallowed, the merged item keeps the
+    -- outer one's datetime and range, so it stays the outer annotation.
+    local outer = highlight("2026-01-01 10:00:00", "/body/p[2]/text()[1].0",
+        "/body/p[2]/text()[1].80", "long passage", "outer", "srv-outer")
+    local inner = highlight("2026-01-01 10:05:00", "/body/p[2]/text()[1].10",
+        "/body/p[2]/text()[1].30", "passage", nil)
+    local contained_state, outer_id, inner_id = synced({ outer, inner })
+    eq(outer_id, "srv-outer", "an outer highlight that has a Coppice id keeps it")
+    local kept = highlight(outer.datetime, outer.pos0, outer.pos1, "long passage", "outer")
+    local kept_inputs = AnnotationSync.plan({ kept }, contained_state, merge_options)
+    eq(kept_inputs[1].id, "srv-outer",
+        "a merge that changes nothing about the outer highlight maps back to its Coppice id")
+    eq(table.concat(queued(contained_state, "delete"), ","), inner_id,
+        "only the swallowed inner highlight is deleted")
+    eq(#queued(contained_state, "upsert"), 0,
+        "an unchanged outer highlight is not re-uploaded")
+
+    local noted_inner = highlight(inner.datetime, inner.pos0, inner.pos1, "passage", "inner")
+    local noted_state, _noted_outer, noted_inner_id = synced({ outer, noted_inner })
+    local noted = highlight(outer.datetime, outer.pos0, outer.pos1, "long passage", "outer\ninner")
+    local noted_inputs = AnnotationSync.plan({ noted }, noted_state, merge_options)
+    eq(noted_inputs[1].id, "srv-outer", "joined notes edit the outer highlight in place")
+    eq(noted_inputs[1].base_rev, 1, "that edit is compare-and-set against the outer revision")
+    eq(noted_state.queue["srv-outer"].op, "upsert", "the note edit is queued")
+    eq(table.concat(queued(noted_state, "delete"), ","), noted_inner_id,
+        "the inner highlight is still deleted when notes were joined")
+end
+checkMergedHighlights()
 -- ----------------------------------------------------------------- report
 
 io.write(string.format("\n%d passed, %d failed (%s)\n", passed, failed, _VERSION))

@@ -721,12 +721,21 @@ function Coppice:localBookPath(item)
         return self.ui.document.file
     end
     if self.browser then
+        local by_hash
         for _unused, local_item in ipairs(self.browser:onDeviceItems()) do
-            if tostring(local_item.id) == tostring(book_id)
-                    and lfs.attributes(local_item.local_path, "mode") == "file" then
-                return local_item.local_path
+            if lfs.attributes(local_item.local_path, "mode") == "file" then
+                if tostring(local_item.id) == tostring(book_id) then
+                    return local_item.local_path
+                end
+                -- A note made on another copy of the same file (same KOReader
+                -- hash, different media id) opens the copy on this device.
+                if not by_hash and item.book_hash
+                        and local_item.document_hash == item.book_hash then
+                    by_hash = local_item.local_path
+                end
             end
         end
+        return by_hash
     end
 end
 
@@ -1160,10 +1169,23 @@ local function mergeAnnotationState(state, saved)
     state.work_id = state.work_id or saved.work_id
     state.book_id = state.book_id or saved.book_id
     state.document_hash = state.document_hash or saved.document_hash
+    state.edition_sha = state.edition_sha or saved.edition_sha
     if next(state.snapshot) == nil then
         state.snapshot = AnnotationSync.copy(saved.snapshot)
     end
     return state
+end
+
+--- The edition sha256 a `liseurResolveWork` response reports, if any.
+local function editionShaOf(response)
+    local identifiers = type(response) == "table"
+        and type(response.identifiers) == "table" and response.identifiers or {}
+    for _unused, identifier in ipairs(identifiers) do
+        if type(identifier) == "table" and identifier.kind == "sha256"
+                and type(identifier.value) == "string" then
+            return identifier.value
+        end
+    end
 end
 
 function Coppice:annotationQueueJobs()
@@ -1461,7 +1483,9 @@ function Coppice:drainAnnotationJobs(exclude_document_hash)
                     local resolved, response_or_error, resolve_code_or_error =
                         api:liseurResolveWork(secret, book_id)
                     work_id = resolved
-                    if not work_id then
+                    if work_id then
+                        state.edition_sha = editionShaOf(response_or_error)
+                    else
                         book_err = response_or_error or "no_work_id"
                         book_code = resolve_code_or_error
                     end
@@ -1470,9 +1494,12 @@ function Coppice:drainAnnotationJobs(exclude_document_hash)
                     state.book_id = book_id
                     state.work_id = work_id
                     state.document_hash = job.document_hash
+                    -- The same sha the reader session signs with, so a drain
+                    -- after closing the book never re-pushes what that session
+                    -- already acknowledged.
                     local options = {
                         work_id = work_id,
-                        edition_sha = job.edition_sha,
+                        edition_sha = state.edition_sha,
                         document_hash = job.document_hash,
                         page_count = job.page_count,
                         digest = md5,
@@ -1561,14 +1588,7 @@ function Coppice:performAnnotationSync(pull, interactive)
         end
         return false
     end
-    local edition_sha
-    for _unused, identifier in ipairs(type(response_or_error.identifiers) == "table"
-            and response_or_error.identifiers or {}) do
-        if type(identifier) == "table" and identifier.kind == "sha256"
-                and type(identifier.value) == "string" then
-            edition_sha = identifier.value
-        end
-    end
+    local edition_sha = editionShaOf(response_or_error)
     local document_hash = KoSync.documentHash(doc_settings) or ""
     local items = self.ui.annotation.annotations or {}
     local page_count = self.ui.document
@@ -1583,6 +1603,7 @@ function Coppice:performAnnotationSync(pull, interactive)
     state.work_id = work_id
     state.book_id = book_id
     state.document_hash = document_hash
+    state.edition_sha = edition_sha
     state.snapshot = AnnotationSync.copy(items)
     local job_key = AnnotationSync.bookKey(book_id, document_hash)
     AnnotationSync.saveState(doc_settings, state)

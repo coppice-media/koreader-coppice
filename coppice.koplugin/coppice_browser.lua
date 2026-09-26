@@ -33,6 +33,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Font = require("ui/font")
+local Event = require("ui/event")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local Blitbuffer = require("ffi/blitbuffer")
@@ -141,10 +142,13 @@ function Browser:init()
     self.history = {}
     self.layout = Catalog.layout(Screen:getWidth(), Screen:getHeight(), Screen:scaleBySize(1000) / 1000)
     self.cache_dir = DataStorage:getDataDir() .. "/cache/coppice-covers"
-    self.key_events = {
-        Back = { { "Back" } },
-        Escape = { { "Esc" } },
-    }
+    -- Merged into the table InputContainer:_init() made, never replaced:
+    -- KOReader master binds the physical Home key there on every widget.
+    self.key_events.Back = { { Device.input.group.Back } }
+    if Device:hasKeys() then
+        -- KOReader v2026.07.1 has no default Home binding of its own.
+        self.key_events.Home = { { "Home" } }
+    end
     self.screen_state = { kind = "home", title = _("Coppice") }
     self.screen_state.data = self:cachedHomeData()
     self:renderHome(self.screen_state.data)
@@ -156,13 +160,27 @@ function Browser:onBack()
     return true
 end
 
-function Browser:onEscape()
+function Browser:onReturn()
     self:back()
     return true
 end
 
-function Browser:onReturn()
-    self:back()
+-- KOReader's `Close` event: broadcast on exit and USB mass storage, and what
+-- KOReader master's InputContainer:onHome() calls on the window it closes.
+function Browser:onClose()
+    self:close()
+    return true
+end
+
+-- The physical Home key. KOReader master's InputContainer:onHome() closes
+-- this window through onClose() and re-sends Home to the reader or file
+-- manager underneath; v2026.07.1 has no such handler, so do the same here.
+function Browser:onHome()
+    if InputContainer.onHome then
+        return InputContainer.onHome(self)
+    end
+    self:close()
+    UIManager:nextTick(function() UIManager:sendEvent(Event:new("Home")) end)
     return true
 end
 
@@ -695,11 +713,15 @@ function Browser:onDeviceItems()
                     local ok, settings = pcall(DocSettings.open, DocSettings, path)
                     local id = ok and settings and settings:readSetting("coppice_media_id")
                     if type(id) == "string" and id ~= "" then
+                        local hash = settings:readSetting("partial_md5_checksum")
                         result[#result + 1] = {
                             id = id,
                             title = name:gsub("%.[^.]+$", ""),
                             extension = suffix,
                             local_path = path,
+                            -- Byte-identical copies share it across media ids.
+                            document_hash = type(hash) == "string" and hash ~= ""
+                                and hash or nil,
                             kind = "book",
                             cover_kind = "media",
                         }
@@ -886,11 +908,10 @@ function Browser:coverTile(item, width, cover_height, on_select, options, on_hol
             VerticalGroup:new(children),
         },
     }
-    local tile = InputContainer:new{
-        frame,
-        key_events = {},
-        ges_events = {},
-    }
+    -- InputContainer:_init() makes the instance key/gesture tables (and, on
+    -- KOReader master, binds Home in them; a tile is not window-level, so
+    -- that binding is inert and Home reaches the browser).
+    local tile = InputContainer:new{ frame }
     tile.dimen = frame:getSize()
     tile.ges_events = {
         TapSelect = { GestureRange:new{ ges = "tap", range = tile.dimen } },
@@ -1136,6 +1157,8 @@ function Browser:recentAnnotations(titles, cache_only)
             local id = item.book_id or item.media_id
             item.title = (id and titles and titles[tostring(id)])
                 or item.book_title or item.title
+            -- Exact media id only; a byte-identical copy under another id is
+            -- found by `Coppice:localBookPath` via `book_hash` on tap.
             item.local_path = item.local_path
                 or (id and local_paths[tostring(id)])
             item.source = item.source or Catalog.annotationSource(item)
@@ -1318,7 +1341,7 @@ function Browser:audioToggle(show_audio, on_change)
             alpha = true,
         },
     }
-    local button = InputContainer:new{ frame, key_events = {}, ges_events = {} }
+    local button = InputContainer:new{ frame }
     button.dimen = frame:getSize()
     button.ges_events = { TapToggle = { GestureRange:new{ ges = "tap", range = button.dimen } } }
     function button:onTapToggle()
@@ -1436,12 +1459,25 @@ end
 -- Highlight colours as KOReader draws them, plus Liseur's pink.
 local EXTRA_HIGHLIGHT_COLORS = { pink = "#FF66AA" }
 
+-- The hex code a highlight colour name is drawn with: the reader's custom
+-- colour when the user changed one (KOReader `highlight_custom_colors`,
+-- `{ [name] = { name = label, code = "#RRGGBB" } }`), else KOReader's
+-- built-in, else Liseur's.
+local function highlightHex(name)
+    local custom = G_reader_settings:readSetting("highlight_custom_colors")
+    local override = type(custom) == "table" and custom[name]
+    local code = type(override) == "table" and override.code
+    if type(code) == "string" and code:match("^#%x%x%x%x%x%x$") then
+        return code
+    end
+    return (Blitbuffer.HIGHLIGHT_COLORS or {})[name] or EXTRA_HIGHLIGHT_COLORS[name]
+end
+
 -- A highlight's chip colours: fill (mixed with white so black text stays
 -- readable; light gray on grayscale screens) and border (the full colour).
 local function highlightTint(name)
     if type(name) ~= "string" then return nil end
-    local hex = (Blitbuffer.HIGHLIGHT_COLORS or {})[name:lower()]
-        or EXTRA_HIGHLIGHT_COLORS[name:lower()]
+    local hex = highlightHex(name:lower())
     if not hex or not Blitbuffer.ColorRGB32 then return nil end
     local function channel(offset, weight)
         local value = tonumber(hex:sub(offset, offset + 1), 16) or 255
@@ -1511,7 +1547,7 @@ function Browser:annotationCard(item, width)
         bordersize = 0,
         content,
     }
-    local card = InputContainer:new{ frame, key_events = {}, ges_events = {} }
+    local card = InputContainer:new{ frame }
     card.dimen = frame:getSize()
     card.ges_events = {
         TapAnnotation = { GestureRange:new{ ges = "tap", range = card.dimen } },

@@ -47,8 +47,13 @@ and notes; recently opened books; paginated Recently added covers; and the
 Browse actions. Its status line includes time, battery, Wi-Fi, server
 reachability, and queued progress/annotation updates. Recent highlights and
 notes are the four newest from the server across every book and app (Liseur,
-Home, Kobo, KOReader), cached for offline viewing. An audiobook's page offers its
-ebook edition when one is linked; KOReader cannot play audio.
+Home, Kobo, KOReader), cached for offline viewing. Tapping one opens the copy on
+this device — matched by media id, or by KOReader document hash when the note was
+made on another copy of the same file — and jumps to it. An audiobook's page offers its
+ebook edition when one is linked; KOReader cannot play audio. Highlight chips
+are tinted with the colours the reader draws with — a custom colour code set
+under KOReader's highlight colour menu replaces the built-in one — and Liseur's
+pink keeps its own tint.
 
 Home is always exactly one screen wide and never scrolls sideways. It fits on
 one screen or scrolls over at most two: each swipe moves a full screen and
@@ -58,6 +63,12 @@ of four, and reading stats and recently opened books become compact text rows.
 Browse is a 3 × 3 grid; recently added books and all notes are reached from
 their Home sections. Tap a Continue-reading cover to open its valid local
 file directly; otherwise it opens book details. Long-press always opens details.
+
+On devices with keys, **Back** steps back through the browser's screens and
+closes it at the root; **Home** closes the browser and then hands the key to
+the file browser or reader underneath, as KOReader's own Home key does
+(KOReader master supplies that daisy chain, the plugin does the same on
+v2026.07.1). KOReader's exit and USB-storage `Close` broadcast closes it too.
 
 Search covers library results. Catalog views use a paginated four-column,
 three-row cover-only grid with a count/sort subtitle, page controls, and a
@@ -194,7 +205,10 @@ color nor style. KOReader locators restore their native positions. Readium/Liseu
 locators are imported only when the excerpt and optional before/after context
 produce one unique match in the same chapter or href. Ambiguous or unmatched
 annotations stay in the read-only **Remote notes** list instead of being
-assigned a guessed location.
+assigned a guessed location. Merging highlights in KOReader deletes the
+originals and saves one new highlight, so the next sync deletes both on the
+server and uploads the merged one; when one highlight lay inside the other,
+the merged item keeps the outer highlight's identity and is edited in place.
 
 Writes use `POST /v1/annotations`; pulls use
 `GET /v1/works/{work_id}/annotations?include_deleted=true`, including server
@@ -206,9 +220,9 @@ the newer `client_ts` wins; a local edit newer than a server tombstone is
 recreated under a new stable ID rather than reviving the deleted record.
 
 Host checks cover bidirectional mapping, style/color fidelity, safe remote
-anchoring, duplicate-pull prevention, persisted queues, deletes, and revision
-conflicts. KOReader UI and device/network behavior still require the
-on-device checklist below.
+anchoring, duplicate-pull prevention, imports that are never pushed back until
+edited, persisted queues, deletes, and revision conflicts. KOReader UI and
+device/network behavior still require the on-device checklist below.
 
 
 ## Screenshots
@@ -241,12 +255,14 @@ remain comfortable on e-ink.
 
 Pure behavior checks cover catalog mapping, layout and paging, URL construction,
 cache eviction, OPDS, bidirectional annotation/color/style mapping, queue
-persistence and idempotence, edit/delete revision conflicts, exact/readium
-anchoring, tombstone removal, KOSync settings, credential-lane selection, and
-migration boundaries. The host browser harness exercises search submission
-through the default Enter action, the live GraphQL result shape and cover grid,
-downloaded Continue-reading tap/long-press behavior, and the 305-book visible-page
-regression at both supported test geometries.
+persistence and idempotence, edit/delete revision conflicts, merged highlights,
+exact/readium anchoring, tombstone removal, KOSync settings, credential-lane
+selection, and migration boundaries. The host browser harness exercises search
+submission through the default Enter action, the live GraphQL result shape and
+cover grid, downloaded Continue-reading tap/long-press behavior, physical
+Back/Home/Close key handling on both KOReader v2026.07.1 and master, custom
+highlight chip colours, and the 305-book visible-page regression at both
+supported test geometries.
 
 ```sh
 luajit tests/pure_checks.lua
@@ -258,8 +274,9 @@ for module in coppice.koplugin/*.lua; do luajit -b "$module" /dev/null; done
 ## On-device checklist
 
 - Open a linked book and confirm the server's annotations pull once; pull again
-  and verify no duplicates. Check exact KOReader x-pointer restoration and
-  Readium excerpt/context anchoring in the same chapter or href.
+  and verify no duplicates and that their server revisions are unchanged.
+  Check exact KOReader x-pointer restoration and Readium excerpt/context
+  anchoring in the same chapter or href.
 - Confirm unsupported/ambiguous excerpts remain only in **Remote notes** and
   are not inserted at a guessed position.
 - Add and recolor/restyle a highlight, add a note, and add a bookmark. Verify

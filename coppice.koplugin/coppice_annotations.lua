@@ -352,21 +352,28 @@ function Annotations.one(item, opts)
     local revisions = opts.revisions or {}
     local previous = revisions[id]
     local revision = type(previous) == "table" and previous.rev or previous
-    local client_ts = item.datetime_updated or item.datetime
 
     local input = {
         id = id,
         work_id = opts.work_id,
         base_rev = tonumber(revision) or 0,
-        edition_sha = (not item.datetime_updated and item.coppice_edition_sha)
-            or opts.edition_sha,
         kind = kind,
         locator = locator,
-        progression = (not item.datetime_updated and item.coppice_progression)
-            or Annotations.progression(item, opts.page_count),
-        client_ts = (not item.datetime_updated and item.coppice_client_ts)
-            or Annotations.clientTs(client_ts, opts.now),
     }
+    if item.coppice_remote and not item.datetime_updated then
+        -- An import the user has not touched replays the wire values it was
+        -- built from, absent ones included: `opts.edition_sha`/`page_count`
+        -- differ between a reader session and a queued drain, and a payload
+        -- that changed with them would be pushed back as an edit.
+        input.edition_sha = item.coppice_edition_sha
+        input.progression = item.coppice_progression
+        input.client_ts = item.coppice_client_ts
+    else
+        input.edition_sha = opts.edition_sha
+        input.progression = Annotations.progression(item, opts.page_count)
+        input.client_ts = Annotations.clientTs(
+            item.datetime_updated or item.datetime, opts.now)
+    end
 
     local excerpt = Annotations.clip(item.text, Annotations.MAX_EXCERPT_BYTES)
     if excerpt then input.excerpt = excerpt end
